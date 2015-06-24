@@ -46,6 +46,8 @@ type DbfTable struct {
 	fileEncoding string
 	// keeps the dbase table in memory as byte array
 	dataStore []byte
+	decoder   mahonia.Decoder
+	encoder   mahonia.Encoder
 }
 
 type DbfField struct {
@@ -60,9 +62,6 @@ func (df *DbfField) SetFieldName(fieldName string) {
 }
 
 func NewFromFile(fileName string, fileEncoding string) (table *DbfTable, err error) {
-	// create a decoder to decode file correctly
-	d := mahonia.NewDecoder(fileEncoding)
-
 	s, err := readFile(fileName)
 
 	if err != nil {
@@ -73,6 +72,8 @@ func NewFromFile(fileName string, fileEncoding string) (table *DbfTable, err err
 	dt := new(DbfTable)
 
 	dt.fileEncoding = fileEncoding
+	dt.encoder = mahonia.NewEncoder(fileEncoding)
+	dt.decoder = mahonia.NewDecoder(fileEncoding)
 
 	// read dbase table header information
 	dt.fileSignature = s[0]
@@ -93,7 +94,7 @@ func NewFromFile(fileName string, fileEncoding string) (table *DbfTable, err err
 	for i := 0; i < int(dt.numberOfFields); i++ {
 		offset := (i * 32) + 32
 
-		fieldName := strings.Trim(d.ConvertString(string(s[offset:offset+10])), string([]byte{0}))
+		fieldName := strings.Trim(dt.encoder.ConvertString(string(s[offset:offset+10])), string([]byte{0}))
 		dt.fieldMap[fieldName] = i
 
 		var err error
@@ -147,6 +148,8 @@ func New(encoding string) (table *DbfTable) {
 	dt := new(DbfTable)
 
 	dt.fileEncoding = encoding
+	dt.encoder = mahonia.NewEncoder(encoding)
+	dt.decoder = mahonia.NewDecoder(encoding)
 
 	// set whether or not this table created from the scratch
 	dt.cratedFromScratch = true
@@ -226,8 +229,65 @@ func (dt *DbfTable) SetFieldValueByName(row int, fieldName string, value string)
 // Sets field value by name
 func (dt *DbfTable) SetFieldValue(row int, fieldIndex int, value string) (err error) {
 
-	e := mahonia.NewEncoder(dt.fileEncoding)
-	b := []byte(e.ConvertString(value))
+	b := []byte(dt.encoder.ConvertString(value))
+
+	fieldLength := int(dt.fields[fieldIndex].fieldLength)
+
+	//DEBUG
+
+	//fmt.Printf("dt.numberOfBytesInHeader=%v\n\n", dt.numberOfBytesInHeader)
+	//fmt.Printf("dt.lengthOfEachRecord=%v\n\n", dt.lengthOfEachRecord)
+
+	// locate the offset of the field in DbfTable dataStore
+	offset := int(dt.numberOfBytesInHeader)
+	lengthOfRecord := int(dt.lengthOfEachRecord)
+
+	offset = offset + (row * lengthOfRecord)
+
+	recordOffset := 1
+
+	for i := 0; i < len(dt.fields); i++ {
+		if i == fieldIndex {
+			break
+		} else {
+			recordOffset += int(dt.fields[i].fieldLength)
+		}
+	}
+
+	// first fill the field with space values
+	for i := 0; i < fieldLength; i++ {
+		dt.dataStore[offset+recordOffset+i] = 0x20
+	}
+
+	// write new value
+	switch dt.fields[fieldIndex].fieldType {
+	case "C", "L", "D":
+		for i := 0; i < len(b) && i < fieldLength; i++ {
+			dt.dataStore[offset+recordOffset+i] = b[i]
+		}
+	case "N":
+		for i := 0; i < fieldLength; i++ {
+			// fmt.Printf("i:%v\n", i)
+			if i < len(b) {
+				dt.dataStore[offset+recordOffset+(fieldLength-i-1)] = b[(len(b)-1)-i]
+			} else {
+				break
+			}
+		}
+	}
+
+	return
+
+	//fmt.Printf("field value:%#v\n", []byte(value))
+	//fmt.Printf("field index:%#v\n", fieldIndex)
+	//fmt.Printf("field length:%v\n", dt.Fields[fieldIndex].fieldLength)
+	//fmt.Printf("string to byte:%#v\n", b)
+
+}
+
+func (dt *DbfTable) SetFieldValueUtf8(row int, fieldIndex int, value string) (err error) {
+
+	b := []byte(value)
 
 	fieldLength := int(dt.fields[fieldIndex].fieldLength)
 
@@ -285,8 +345,43 @@ func (dt *DbfTable) SetFieldValue(row int, fieldIndex int, value string) (err er
 
 func (dt *DbfTable) FieldValue(row int, fieldIndex int) (value string) {
 
-	// create decoder to convert bytes to utf-8
-	d := mahonia.NewDecoder(dt.fileEncoding)
+	offset := int(dt.numberOfBytesInHeader)
+	lengthOfRecord := int(dt.lengthOfEachRecord)
+
+	offset = offset + (row * lengthOfRecord)
+
+	recordOffset := 1
+
+	for i := 0; i < len(dt.fields); i++ {
+		if i == fieldIndex {
+			break
+		} else {
+			recordOffset += int(dt.fields[i].fieldLength)
+		}
+	}
+
+	temp := dt.dataStore[(offset + recordOffset):((offset + recordOffset) + int(dt.fields[fieldIndex].fieldLength))]
+
+	for i := 0; i < len(temp); i++ {
+		if temp[i] == 0x00 {
+			temp = temp[0:i]
+			break
+		}
+	}
+
+	s := dt.decoder.ConvertString(string(temp))
+	//fmt.Printf("utf-8 value:[%#v] original value:[%#v]\n", s, string(temp))
+
+	value = strings.TrimSpace(s)
+
+	//fmt.Printf("raw value:[%#v]\n", dt.dataStore[(offset + recordOffset):((offset + recordOffset) + int(dt.Fields[fieldIndex].fieldLength))])
+	//fmt.Printf("raw value:[%#v]\n", temp)
+	//fmt.Printf("utf-8 value:[%#v]\n", []byte(s))
+	//value = string(dt.dataStore[(offset + recordOffset):((offset + recordOffset) + int(dt.Fields[fieldIndex].fieldLength))])
+	return
+}
+
+func (dt *DbfTable) FieldValueUtf8(row int, fieldIndex int) (value string) {
 
 	offset := int(dt.numberOfBytesInHeader)
 	lengthOfRecord := int(dt.lengthOfEachRecord)
@@ -312,12 +407,13 @@ func (dt *DbfTable) FieldValue(row int, fieldIndex int) (value string) {
 		}
 	}
 
-	s := d.ConvertString(string(temp))
-	//fmt.Printf("utf-8 value:[%#v]\n", s)
+	//s := dt.decoder.ConvertString(string(temp))
+	//fmt.Printf("utf-8 value:[%#v] original value:[%#v]\n", s, string(temp))
 
-	value = strings.TrimSpace(s)
+	value = strings.TrimSpace(string(temp))
 
 	//fmt.Printf("raw value:[%#v]\n", dt.dataStore[(offset + recordOffset):((offset + recordOffset) + int(dt.Fields[fieldIndex].fieldLength))])
+	//fmt.Printf("raw value:[%#v]\n", temp)
 	//fmt.Printf("utf-8 value:[%#v]\n", []byte(s))
 	//value = string(dt.dataStore[(offset + recordOffset):((offset + recordOffset) + int(dt.Fields[fieldIndex].fieldLength))])
 	return
@@ -518,7 +614,7 @@ func (dt *DbfTable) updateHeader() {
 func (dt *DbfTable) SaveFile(filename string) (err error) {
 
 	// don't forget to add dbase end of file marker which is 1Ah
-	dt.dataStore = appendSlice(dt.dataStore, []byte{0x1A})
+	//dt.dataStore = appendSlice(dt.dataStore, []byte{0x1A})
 
 	f, err := os.Create(filename)
 	if err != nil {
@@ -527,7 +623,10 @@ func (dt *DbfTable) SaveFile(filename string) (err error) {
 	defer f.Close()
 
 	n, err := f.Write(dt.dataStore)
-
+	m, _ := f.Write([]byte{0x1A})
+	if m != 1 {
+		fmt.Println("could not write footer!")
+	}
 	if err != nil {
 		return err
 	} else {
